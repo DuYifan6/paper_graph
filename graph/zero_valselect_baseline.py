@@ -1,394 +1,676 @@
 # -*- coding: utf-8 -*-
-# lasso_quarterly_train_only_daily15_unroll.py
+"""
+ZeroGraph baseline（validation 选模版）
+- 读取 common_preprocess_fixedsplit.py 生成的公共缓存
+- 不使用任何图输入（nbr_idx=None, nbr_w=None）
+- 训练集按季度输出
+- 测试集按月份输出
+- 增加 validation 切分 / best checkpoint / early stopping
+- validation 选模标准与 Real 版保持一致：按 K=1/3/5/10 的联合指标选最优 epoch
+
+建议用途：
+- 作为 Real-A / Real-B / Real-C 的公平对照基线
+- 不建议在这版里再加 graph 或 Laplacian
+"""
 
 import os
-import glob
+import math
+import json
 import pickle
+import random
+from typing import Any, Dict, List
+
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
-
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LassoCV
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score
 
-
-
-
-DAILY_DIR = r"D:\Lasso\归一化数据\merged\daily"
-
-MIN15_DIR = r"D:\Lasso\归一化数据\merged\minute"
-
-# =========================================================
-# 关键修改：只在训练集上做特征筛选
-# =========================================================
-TRAIN_START = "2022-01-01"
-TRAIN_END   = "2024-12-31"
-
-# 如果你只是想读入全样本但筛选只用训练集，保持 False
-# 如果你想在构建 panel 时也直接裁剪到训练集，可以改 True
-FILTER_PANEL_TO_TRAIN_ONLY = False
-
-# 15min 每天 5 根 K 线
-N_BARS = 5
-
-# 输出
-OUT_DIR = r"D:\PythonProject\LASSO_FINAL\lasso_feature_selection_train_only"
-os.makedirs(OUT_DIR, exist_ok=True)
-
-OUT_PKL = os.path.join(OUT_DIR, "quarterly_lasso_train_only_daily15_unroll.pkl")
-OUT_SELECTED_EACH_Q_CSV = os.path.join(OUT_DIR, "selected_features_by_quarter_train_only.csv")
-OUT_STABILITY_CSV = os.path.join(OUT_DIR, "selected_features_stability_train_only.csv")
-OUT_PANEL_INFO_CSV = os.path.join(OUT_DIR, "panel_info_train_only.csv")
-
-
-# =========================================================
-# 1) 读日频：y 取最后一列
-# =========================================================
-def load_daily_with_y():
-    files = glob.glob(os.path.join(DAILY_DIR, "*.csv"))
-    print(f"📌 daily 文件数：{len(files)}")
-
-    dfs = []
-    for f in tqdm(files, desc="读取 daily"):
-        df = pd.read_csv(f)
-
-        if "trade_date" not in df.columns:
-            raise ValueError(f"{f} 缺少 trade_date 列")
-        if "ts_code" not in df.columns:
-            raise ValueError(f"{f} 缺少 ts_code 列")
-
-        df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        df = df.dropna(subset=["trade_date"]).copy()
-
-        # 最后一列作为连续 y
-        y_col = df.columns[-1]
-        df = df.rename(columns={y_col: "y"})
-
-        exclude = {"ts_code", "trade_date", "y"}
-        feat_cols = [c for c in df.columns if c not in exclude]
-
-        # 给日频特征加 D_ 前缀
-        rename_map = {c: "D_" + c for c in feat_cols}
-        df = df.rename(columns=rename_map)
-
-        keep = ["ts_code", "trade_date", "y"] + list(rename_map.values())
-        dfs.append(df[keep])
-
-    if not dfs:
-        raise RuntimeError("❌ daily 没读到任何可用文件")
-
-    return pd.concat(dfs, ignore_index=True)
-
-
-# =========================================================
-# 2) 读 15min：不聚合，按天展开成 M_{feat}_{k}
-# =========================================================
-def load_minute_unrolled():
-    files = glob.glob(os.path.join(MIN15_DIR, "*.csv"))
-    print(f"\n📌 minute 文件数：{len(files)}")
-
-    out_list = []
-    for f in tqdm(files, desc="读取 minute"):
-        df = pd.read_csv(f)
-
-        if "trade_time" not in df.columns:
-            raise ValueError(f"{f} 缺少 trade_time 列")
-
-        df["trade_time"] = pd.to_datetime(df["trade_time"], errors="coerce")
-        df = df.dropna(subset=["trade_time"]).copy()
-        df["trade_date"] = df["trade_time"].dt.strftime("%Y-%m-%d")
-
-        if "ts_code" not in df.columns:
-            base = os.path.basename(f)
-            df["ts_code"] = base.split("_")[0].replace(".csv", "")
-
-        exclude = {"ts_code", "trade_time", "trade_date"}
-        minute_feats = [c for c in df.columns if c not in exclude]
-        minute_feats = [c for c in minute_feats if pd.api.types.is_numeric_dtype(df[c])]
-
-        if not minute_feats:
-            continue
-
-        df = df.sort_values(["ts_code", "trade_date", "trade_time"])
-        df["bar_idx"] = df.groupby(["ts_code", "trade_date"]).cumcount()
-        df = df[df["bar_idx"] < N_BARS].copy()
-
-        wide_rows = []
-        for (ts, d), sub in df.groupby(["ts_code", "trade_date"], sort=False):
-            sub = sub.sort_values("trade_time")
-            row = {"ts_code": ts, "trade_date": d}
-
-            for k in range(N_BARS):
-                if k < len(sub):
-                    for feat in minute_feats:
-                        row[f"M_{feat}_{k+1}"] = sub.iloc[k][feat]
-                else:
-                    for feat in minute_feats:
-                        row[f"M_{feat}_{k+1}"] = np.nan
-
-            wide_rows.append(row)
-
-        if wide_rows:
-            out_list.append(pd.DataFrame(wide_rows))
-
-    if not out_list:
-        raise RuntimeError("❌ minute 没读到任何可用数据")
-
-    return pd.concat(out_list, ignore_index=True)
-
-
-# =========================================================
-# 3) 构建 panel + shift(1)
-# =========================================================
-def build_panel():
-    daily = load_daily_with_y()
-    minute_wide = load_minute_unrolled()
-
-    print("\n📌 合并日频 + 15min 展开")
-    panel = daily.merge(minute_wide, on=["ts_code", "trade_date"], how="left")
-
-    panel["date"] = pd.to_datetime(panel["trade_date"], errors="coerce")
-    panel = panel.dropna(subset=["date"]).copy()
-    panel = panel.sort_values(["ts_code", "date"])
-
-    panel = panel.dropna(subset=["y"]).copy()
-
-    exclude = {"ts_code", "trade_date", "date", "y"}
-    feature_cols = [c for c in panel.columns if c not in exclude]
-    feature_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(panel[c])]
-
-    print(f"📌 合并后特征数：{len(feature_cols)}")
-    print(f"📌 panel 行数 shift 前：{len(panel):,}")
-
-    # t-1 特征预测 t 的 y
-    panel[feature_cols] = panel.groupby("ts_code", group_keys=False)[feature_cols].shift(1)
-
-    # 可选：构建阶段就只保留训练集
-    if FILTER_PANEL_TO_TRAIN_ONLY:
-        train_start = pd.to_datetime(TRAIN_START)
-        train_end = pd.to_datetime(TRAIN_END)
-        panel = panel[(panel["date"] >= train_start) & (panel["date"] <= train_end)].copy()
-
-    # y 不能缺
-    panel = panel.dropna(subset=["y"]).copy()
-
-    # 注意：这里先不按全样本删除全空列，避免用测试期信息判断列是否有效
-    print(f"📌 panel 行数 shift 后：{len(panel):,}")
-    print(f"📌 panel 日期范围：{panel['date'].min().date()} ~ {panel['date'].max().date()}")
-
-    return panel, feature_cols
-
-
-# =========================================================
-# 4) 只在训练集上确定有效特征列
-# =========================================================
-def get_train_feature_cols(panel, feature_cols):
-    train_start = pd.to_datetime(TRAIN_START)
-    train_end = pd.to_datetime(TRAIN_END)
-
-    train_panel = panel[(panel["date"] >= train_start) & (panel["date"] <= train_end)].copy()
-
-    if train_panel.empty:
-        raise ValueError(
-            f"❌ 训练集为空，请检查 TRAIN_START/TRAIN_END: {TRAIN_START} ~ {TRAIN_END}"
-        )
-
-    # 只用训练集判断哪些特征不是全空
-    train_feature_cols = [c for c in feature_cols if not train_panel[c].isna().all()]
-
-    print("\n========== 训练集筛选范围 ==========")
-    print(f"TRAIN_START: {TRAIN_START}")
-    print(f"TRAIN_END  : {TRAIN_END}")
-    print(f"训练集行数  : {len(train_panel):,}")
-    print(f"训练集股票数: {train_panel['ts_code'].nunique():,}")
-    print(f"训练集日期  : {train_panel['date'].min().date()} ~ {train_panel['date'].max().date()}")
-    print(f"训练集有效特征数: {len(train_feature_cols)}")
-
-    info = pd.DataFrame([{
-        "TRAIN_START": TRAIN_START,
-        "TRAIN_END": TRAIN_END,
-        "n_rows_train": len(train_panel),
-        "n_stocks_train": train_panel["ts_code"].nunique(),
-        "date_min_train": train_panel["date"].min(),
-        "date_max_train": train_panel["date"].max(),
-        "n_features_before_train_filter": len(feature_cols),
-        "n_features_after_train_filter": len(train_feature_cols),
-    }])
-    info.to_csv(OUT_PANEL_INFO_CSV, index=False, encoding="utf-8-sig")
-
-    return train_panel, train_feature_cols
-
-
-# =========================================================
-# 5) 按季度 LassoCV：只用训练集季度
-# =========================================================
-def run_quarterly_lasso_train_only(train_panel, feature_cols):
-    fs = train_panel.copy()
-    fs["quarter"] = fs["date"].dt.to_period("Q")
-    quarters = sorted(fs["quarter"].unique())
-
-    print("\n🔥 只在训练集参与 LassoCV 的季度：")
-    print(quarters)
-
-    results = {}
-    selected_rows = []
-
-    for q in tqdm(quarters, desc="按训练集季度 LassoCV"):
-        sub = fs[fs["quarter"] == q].dropna(subset=feature_cols, how="all").copy()
-
-        if len(sub) < 5000:
-            print(f"{q} 样本太少（{len(sub)}），跳过")
-            continue
-
-        X = sub[feature_cols].values
-        y = pd.to_numeric(sub["y"], errors="coerce").values
-
-        valid_y = np.isfinite(y)
-        X = X[valid_y]
-        y = y[valid_y]
-
-        if len(y) < 5000:
-            print(f"{q} 有效 y 样本太少（{len(y)}），跳过")
-            continue
-
-        pipe = Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("sc", StandardScaler()),
-            ("lasso", LassoCV(
-                cv=3,
-                n_jobs=-1,
-                random_state=0,
-                max_iter=20000
-            ))
-        ])
-
-        pipe.fit(X, y)
-
-        lasso = pipe.named_steps["lasso"]
-        alpha = float(lasso.alpha_)
-
-        y_hat = pipe.predict(X)
-        mse = mean_squared_error(y, y_hat)
-        r2 = r2_score(y, y_hat)
-
-        coef = lasso.coef_
-        coef_df = pd.DataFrame({
-            "feature": feature_cols,
-            "coef": coef,
-            "abs_coef": np.abs(coef),
-            "selected": coef != 0
-        }).sort_values("abs_coef", ascending=False)
-
-        selected_df = coef_df[coef_df["selected"]].copy()
-        selected_df["quarter"] = str(q)
-        selected_df["alpha"] = alpha
-        selected_df["mse"] = mse
-        selected_df["r2"] = r2
-        selected_df["n_obs"] = len(y)
-
-        selected_rows.append(selected_df)
-
-        results[str(q)] = {
-            "alpha": alpha,
-            "mse": mse,
-            "r2": r2,
-            "n_obs": len(y),
-            "n_selected": int((coef != 0).sum()),
-            "coef_table": coef_df,
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# =======================
+# 0) 配置
+# =======================
+CACHE_NPZ = r"D:\PythonProject\LASSO_FINAL\common_preprocess_cache\common_tensor_cache.npz"
+META_PKL  = r"D:\PythonProject\LASSO_FINAL\common_preprocess_cache\common_tensor_meta.pkl"
+
+EXP_NAME = "ZeroGraph_valselect"
+
+LOOKBACK = 20
+HIDDEN = 128
+NUM_LAYERS = 1
+DROPOUT = 0.1
+LR = 5e-4
+WEIGHT_DECAY = 1e-4
+EPOCHS = 20
+GRAD_CLIP = 1.0
+GATE_HIDDEN = 128
+
+MIN_VALID_NODES_PER_DAY = 50
+DM_LAG = 2
+DM_ALTERNATIVE = "greater"
+
+# ===== validation / 选模 =====
+VALID_RATIO = 0.20
+EARLY_STOP_PATIENCE = 4
+
+SELECT_KS = [1, 3, 5, 10]
+SELECT_WEIGHTS = {1: 0.10, 3: 0.40, 5: 0.30, 10: 0.20}
+
+# ===== ranking loss（默认关闭，保持纯 Zero baseline） =====
+USE_RANK_LOSS = False
+RANK_LOSS_LAM = 0.0
+RANK_TOP_FRAC = 0.20
+RANK_MIN_TOP = 5
+RANK_MAX_TOP = 50
+
+OUT_DIR = r"D:\PythonProject\LASSO_FINAL\graph_调整\fixed_zerograph_valselect"
+RESULT_DIR = os.path.join(OUT_DIR, "results")
+PLOT_DIR = os.path.join(OUT_DIR, "plots")
+os.makedirs(RESULT_DIR, exist_ok=True)
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+
+# =======================
+# 1) 工具
+# =======================
+def set_seed(seed: int = 0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+try:
+    from scipy.stats import t as student_t
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+
+def _newey_west_var(d: np.ndarray, lag: int) -> float:
+    d = np.asarray(d, dtype=np.float64)
+    T = d.size
+    if T < 2:
+        return np.nan
+    lag = int(max(0, min(lag, T - 1)))
+
+    x = d - d.mean()
+    gamma0 = np.dot(x, x) / T
+    hac = gamma0
+
+    for k in range(1, lag + 1):
+        w = 1.0 - k / (lag + 1.0)
+        gamma_k = np.dot(x[k:], x[:-k]) / T
+        hac += 2.0 * w * gamma_k
+
+    var_bar = hac / T
+    return float(max(var_bar, 1e-12))
+
+
+def dm_test(d: np.ndarray, lag: int = 0, alternative: str = "greater") -> Dict[str, Any]:
+    d = np.asarray(d, dtype=np.float64)
+    d = d[np.isfinite(d)]
+    T = int(d.size)
+    if T < 5:
+        return {"T": T, "dm": np.nan, "p_one": np.nan, "p_two": np.nan, "mean_d": float(np.nan), "lag": int(lag)}
+
+    mean_d = float(d.mean())
+    var_bar = _newey_west_var(d, lag=lag)
+    dm = mean_d / np.sqrt(var_bar)
+    df = max(T - 1, 1)
+
+    if _HAS_SCIPY:
+        cdf = float(student_t.cdf(dm, df=df))
+        if alternative == "greater":
+            p_one = float(1.0 - cdf)
+        elif alternative == "less":
+            p_one = float(cdf)
+        else:
+            p_one = float(np.nan)
+        p_two = float(2.0 * min(cdf, 1.0 - cdf))
+    else:
+        cdf = 0.5 * (1.0 + math.erf(dm / math.sqrt(2.0)))
+        if alternative == "greater":
+            p_one = float(1.0 - cdf)
+        elif alternative == "less":
+            p_one = float(cdf)
+        else:
+            p_one = float(np.nan)
+        p_two = float(2.0 * min(cdf, 1.0 - cdf))
+
+    return {"T": T, "dm": float(dm), "p_one": p_one, "p_two": p_two, "mean_d": mean_d, "lag": int(lag)}
+
+
+def build_train_val_split(train_start_idx: int, train_end_idx: int, valid_ratio: float = 0.2):
+    total_days = train_end_idx - train_start_idx + 1
+    val_days = max(20, int(round(total_days * valid_ratio)))
+    val_start_idx = max(train_start_idx + LOOKBACK, train_end_idx - val_days + 1)
+    fit_end_idx = val_start_idx - 1
+
+    if fit_end_idx < train_start_idx + LOOKBACK:
+        val_start_idx = train_end_idx + 1
+        fit_end_idx = train_end_idx
+
+    return fit_end_idx, val_start_idx
+
+
+def daily_topk_mean_return(pred_np: np.ndarray, y_np: np.ndarray, ks=(1, 3, 5, 10)):
+    if len(pred_np) == 0:
+        return {k: np.nan for k in ks}
+
+    order = np.argsort(-pred_np)
+    y_sorted = y_np[order]
+
+    out = {}
+    for k in ks:
+        kk = min(k, len(y_sorted))
+        out[k] = float(np.mean(y_sorted[:kk])) if kk > 0 else np.nan
+    return out
+
+
+def compute_selection_score_from_detail(detail_df: pd.DataFrame):
+    if detail_df is None or detail_df.empty:
+        return {
+            "select_score": -1e18,
+            "ret_at_1": np.nan,
+            "ret_at_3": np.nan,
+            "ret_at_5": np.nan,
+            "ret_at_10": np.nan,
         }
 
+    rows = []
+    df = detail_df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+
+    for d, g in df.groupby("date", sort=True):
+        pred_np = g["y_pred"].to_numpy(dtype=float)
+        true_np = g["y_true"].to_numpy(dtype=float)
+        topk_map = daily_topk_mean_return(pred_np, true_np, ks=SELECT_KS)
+        row = {"date": d}
+        for k in SELECT_KS:
+            row[f"ret_at_{k}"] = topk_map[k]
+        rows.append(row)
+
+    daily_df = pd.DataFrame(rows)
+    agg = {f"ret_at_{k}": float(daily_df[f"ret_at_{k}"].mean()) for k in SELECT_KS}
+
+    score = 0.0
+    for k in SELECT_KS:
+        score += SELECT_WEIGHTS[k] * agg[f"ret_at_{k}"]
+
+    agg["select_score"] = float(score)
+    return agg
+
+
+def ranking_loss_top_vs_rest(pred: torch.Tensor, y: torch.Tensor):
+    n = pred.numel()
+    if n < 10:
+        return pred.new_tensor(0.0)
+
+    order = torch.argsort(y, descending=True)
+    top_n = max(RANK_MIN_TOP, int(round(n * RANK_TOP_FRAC)))
+    top_n = min(top_n, RANK_MAX_TOP, n - 1)
+
+    top_idx = order[:top_n]
+    rest_idx = order[top_n:]
+
+    if rest_idx.numel() == 0:
+        return pred.new_tensor(0.0)
+
+    p_top = pred[top_idx].view(-1, 1)
+    p_rest = pred[rest_idx].view(1, -1)
+    loss = F.softplus(-(p_top - p_rest)).mean()
+    return loss
+
+
+# =======================
+# 2) 模型
+# =======================
+class GraphMixKNN(nn.Module):
+    def __init__(self, hidden: int, gate_hidden: int = 64, dropout: float = 0.1):
+        super().__init__()
+        self.lin_gate = nn.Linear(hidden * 2, gate_hidden)
+        self.lin_gate2 = nn.Linear(gate_hidden, hidden)
+        self.lin_msg = nn.Linear(hidden * 2, hidden)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, Z, nbr_idx=None, nbr_w=None, node_valid_mask=None):
+        if nbr_idx is None or nbr_w is None:
+            return Z
+
+        N, H = Z.shape
+        K = nbr_idx.shape[1]
+
+        if node_valid_mask is not None:
+            Z_send = Z * node_valid_mask.view(N, 1)
+        else:
+            Z_send = Z
+
+        nbr_w = torch.nan_to_num(nbr_w, nan=0.0, posinf=0.0, neginf=0.0)
+        nbr_w = torch.clamp(nbr_w, min=0.0)
+
+        Z_nb_raw = Z_send.index_select(0, nbr_idx.reshape(-1)).view(N, K, H)
+        w = nbr_w.view(N, K, 1)
+
+        num = (w * Z_nb_raw).sum(dim=1)
+        den = (nbr_w.sum(dim=1, keepdim=True) + 1e-6)
+        Z_nb = num / den
+
+        cat = torch.cat([Z, Z_nb], dim=1)
+        g = torch.sigmoid(self.lin_gate2(F.relu(self.lin_gate(cat))))
+        delta = self.dropout(F.relu(self.lin_msg(cat)))
+        return Z + g * delta
+
+
+class GraphAugLSTM(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 64, num_layers: int = 1, dropout: float = 0.1, gate_hidden: int = 64):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=in_dim,
+            hidden_size=hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=(dropout if num_layers > 1 else 0.0),
+            bidirectional=False
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.graph = GraphMixKNN(hidden=hidden, gate_hidden=gate_hidden, dropout=dropout)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, X, nbr_idx=None, nbr_w=None, node_valid_mask=None):
+        out, _ = self.lstm(X)
+        z = self.dropout(out[:, -1, :])
+        z = self.graph(z, nbr_idx=nbr_idx, nbr_w=nbr_w, node_valid_mask=node_valid_mask)
+        return self.head(z).squeeze(-1)
+
+
+# =======================
+# 3) 训练 / 评估
+# =======================
+def train_model_on_range(
+    X_np, y_np, mask_np, dates, ts_codes_order,
+    in_dim: int, device: torch.device,
+    train_start_idx: int, train_end_idx: int,
+    seed: int = 0
+):
+    set_seed(seed)
+
+    model = GraphAugLSTM(
+        in_dim=in_dim,
+        hidden=HIDDEN,
+        num_layers=NUM_LAYERS,
+        dropout=DROPOUT,
+        gate_hidden=GATE_HIDDEN
+    ).to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    X = torch.from_numpy(X_np).to(device)
+    y = torch.from_numpy(y_np).to(device)
+    m = torch.from_numpy(mask_np).to(device)
+
+    fit_end_idx, val_start_idx = build_train_val_split(
+        train_start_idx=train_start_idx,
+        train_end_idx=train_end_idx,
+        valid_ratio=VALID_RATIO
+    )
+    use_validation = val_start_idx <= train_end_idx
+
+    def evaluate_for_selection(eval_start_idx: int, eval_end_idx: int):
+        model.eval()
+        detail_rows = []
+
+        with torch.no_grad():
+            loop_start = max(LOOKBACK - 1, eval_start_idx)
+            for t in range(loop_start, eval_end_idx + 1):
+                mt = m[t]
+                if mt.sum().item() < MIN_VALID_NODES_PER_DAY:
+                    continue
+
+                seq = X[t - LOOKBACK + 1:t + 1].permute(1, 0, 2).contiguous()
+                yt = y[t]
+                node_valid = mt.float()
+
+                pred = model(seq, nbr_idx=None, nbr_w=None, node_valid_mask=node_valid)
+                if not torch.isfinite(pred[mt]).all():
+                    continue
+
+                pred_np = pred[mt].detach().cpu().numpy()
+                true_np = yt[mt].detach().cpu().numpy()
+                node_indices = np.where(mt.cpu().numpy())[0]
+                current_date = pd.Timestamp(dates[t]).normalize()
+
+                for node_idx, pred_val, true_val in zip(node_indices, pred_np, true_np):
+                    detail_rows.append({
+                        "date": current_date,
+                        "stock": ts_codes_order[node_idx],
+                        "y_pred": float(pred_val),
+                        "y_true": float(true_val),
+                    })
+
+        if len(detail_rows) == 0:
+            return {"select_score": -1e18}
+
+        detail_df = pd.DataFrame(detail_rows)
+        return compute_selection_score_from_detail(detail_df)
+
+    history_rows = []
+    best_state = None
+    best_score = -1e18
+    best_epoch = -1
+    bad_epochs = 0
+
+    loop_start = max(LOOKBACK - 1, train_start_idx)
+
+    for ep in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+        total_cnt = 0
+        used_days = 0
+
+        for t in range(loop_start, fit_end_idx + 1):
+            mt = m[t]
+            if mt.sum().item() < MIN_VALID_NODES_PER_DAY:
+                continue
+
+            seq = X[t - LOOKBACK + 1:t + 1].permute(1, 0, 2).contiguous()
+            yt = y[t]
+            node_valid = mt.float()
+
+            pred = model(seq, nbr_idx=None, nbr_w=None, node_valid_mask=node_valid)
+            if not torch.isfinite(pred[mt]).all():
+                continue
+
+            pred_t = pred[mt]
+            yt_t = yt[mt]
+
+            mse_loss = F.mse_loss(pred_t, yt_t)
+            loss = mse_loss
+
+            if USE_RANK_LOSS and RANK_LOSS_LAM > 0:
+                rank_loss = ranking_loss_top_vs_rest(pred_t, yt_t)
+                loss = loss + RANK_LOSS_LAM * rank_loss
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if GRAD_CLIP and GRAD_CLIP > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
+
+            total_loss += float(loss.item()) * int(mt.sum().item())
+            total_cnt += int(mt.sum().item())
+            used_days += 1
+
+        avg_loss = total_loss / max(total_cnt, 1)
+
+        if use_validation:
+            val_stat = evaluate_for_selection(val_start_idx, train_end_idx)
+            val_score = float(val_stat["select_score"])
+        else:
+            val_stat = {"ret_at_1": np.nan, "ret_at_3": np.nan, "ret_at_5": np.nan, "ret_at_10": np.nan, "select_score": np.nan}
+            val_score = -avg_loss
+
+        history_rows.append({
+            "epoch": ep,
+            "train_loss": avg_loss,
+            "val_select_score": val_score,
+            "val_ret_at_1": val_stat.get("ret_at_1", np.nan),
+            "val_ret_at_3": val_stat.get("ret_at_3", np.nan),
+            "val_ret_at_5": val_stat.get("ret_at_5", np.nan),
+            "val_ret_at_10": val_stat.get("ret_at_10", np.nan),
+        })
+
         print(
-            f"{q} ✔ alpha={alpha:.3e}, "
-            f"R²={r2:.4f}, "
-            f"非零={int((coef != 0).sum())}, "
-            f"n={len(y):,}"
+            f"epoch {ep}/{EPOCHS} | train_loss={avg_loss:.6f} | used_obs={total_cnt} | used_days={used_days} | "
+            f"val_score={val_score:.6f} | val@1={val_stat.get('ret_at_1', np.nan):.6f} | "
+            f"val@3={val_stat.get('ret_at_3', np.nan):.6f} | val@5={val_stat.get('ret_at_5', np.nan):.6f} | "
+            f"val@10={val_stat.get('ret_at_10', np.nan):.6f}"
         )
 
-    # 保存每季度选中特征
-    if selected_rows:
-        selected_all = pd.concat(selected_rows, ignore_index=True)
-    else:
-        selected_all = pd.DataFrame(columns=[
-            "feature", "coef", "abs_coef", "selected",
-            "quarter", "alpha", "mse", "r2", "n_obs"
-        ])
+        if val_score > best_score:
+            best_score = val_score
+            best_epoch = ep
+            bad_epochs = 0
+            best_state = {
+                "model": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                "epoch": ep,
+                "val_score": val_score,
+            }
+        else:
+            bad_epochs += 1
 
-    selected_all.to_csv(OUT_SELECTED_EACH_Q_CSV, index=False, encoding="utf-8-sig")
+        if use_validation and bad_epochs >= EARLY_STOP_PATIENCE:
+            print(f"[INFO] early stop at epoch={ep}, best_epoch={best_epoch}, best_val_score={best_score:.6f}")
+            break
 
-    # 稳定性统计
-    stability = build_stability_table(selected_all, quarters)
-    stability.to_csv(OUT_STABILITY_CSV, index=False, encoding="utf-8-sig")
+    if best_state is not None:
+        model.load_state_dict(best_state["model"])
 
-    return results, selected_all, stability
+    history_df = pd.DataFrame(history_rows)
+    split_info = {
+        "fit_start_idx": train_start_idx,
+        "fit_end_idx": fit_end_idx,
+        "val_start_idx": val_start_idx if use_validation else None,
+        "val_end_idx": train_end_idx if use_validation else None,
+        "best_epoch": best_epoch,
+        "best_val_score": best_score,
+    }
 
-
-# =========================================================
-# 6) 构造跨季度稳定性表
-# =========================================================
-def build_stability_table(selected_all, quarters):
-    if selected_all.empty:
-        return pd.DataFrame(columns=[
-            "feature", "appear_count", "appear_freq",
-            "avg_coef", "avg_abs_coef", "pos_ratio"
-        ])
-
-    n_q = len(quarters)
-
-    tmp = selected_all.copy()
-    tmp["pos"] = (tmp["coef"] > 0).astype(int)
-
-    stability = (
-        tmp.groupby("feature")
-        .agg(
-            appear_count=("quarter", "nunique"),
-            avg_coef=("coef", "mean"),
-            avg_abs_coef=("abs_coef", "mean"),
-            pos_ratio=("pos", "mean")
-        )
-        .reset_index()
-    )
-
-    stability["appear_freq"] = stability["appear_count"] / n_q
-    stability = stability.sort_values(
-        ["appear_count", "avg_abs_coef"],
-        ascending=[False, False]
-    ).reset_index(drop=True)
-
-    return stability
+    return model, history_df, split_info
 
 
-# =========================================================
-# 7) 主程序
-# =========================================================
+def evaluate_model_on_range(
+    model,
+    X_np, y_np, mask_np, dates, ts_codes_order,
+    device: torch.device,
+    eval_start_idx: int, eval_end_idx: int,
+    loss_curve: List[float]
+):
+    X = torch.from_numpy(X_np).to(device)
+    y = torch.from_numpy(y_np).to(device)
+    m = torch.from_numpy(mask_np).to(device)
+
+    preds, trues = [], []
+    daily_dates = []
+    daily_mse = []
+    daily_sse = []
+    daily_nobs = []
+    detail_rows = []
+
+    model.eval()
+    with torch.no_grad():
+        loop_start = max(LOOKBACK - 1, eval_start_idx)
+
+        for t in range(loop_start, eval_end_idx + 1):
+            mt = m[t]
+            if mt.sum().item() < MIN_VALID_NODES_PER_DAY:
+                continue
+
+            seq = X[t - LOOKBACK + 1:t + 1].permute(1, 0, 2).contiguous()
+            yt = y[t]
+            node_valid = mt.float()
+
+            pred = model(seq, nbr_idx=None, nbr_w=None, node_valid_mask=node_valid)
+            if not torch.isfinite(pred[mt]).all():
+                continue
+
+            err = pred[mt] - yt[mt]
+            sse_day = float((err * err).sum().item())
+            n_day = int(mt.sum().item())
+            mse_day = sse_day / max(n_day, 1)
+
+            current_date = pd.Timestamp(dates[t]).normalize()
+            daily_dates.append(current_date)
+            daily_sse.append(sse_day)
+            daily_mse.append(mse_day)
+            daily_nobs.append(n_day)
+
+            pred_np = pred[mt].detach().cpu().numpy()
+            true_np = yt[mt].detach().cpu().numpy()
+            node_indices = np.where(mt.cpu().numpy())[0]
+
+            preds.append(pred_np)
+            trues.append(true_np)
+
+            for node_idx, pred_val, true_val in zip(node_indices, pred_np, true_np):
+                detail_rows.append({
+                    "date": current_date,
+                    "stock": ts_codes_order[node_idx],
+                    "y_pred": float(pred_val),
+                    "y_true": float(true_val),
+                })
+
+    if len(preds) == 0:
+        return None
+
+    y_pred = np.concatenate(preds)
+    y_true = np.concatenate(trues)
+    finite = np.isfinite(y_pred) & np.isfinite(y_true)
+    y_pred = y_pred[finite]
+    y_true = y_true[finite]
+
+    mse = float(mean_squared_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred)) if len(np.unique(y_true)) > 1 else float("nan")
+
+    return {
+        "mse": mse,
+        "r2": r2,
+        "n_obs": int(len(y_true)),
+        "loss_curve": loss_curve,
+        "daily_df": pd.DataFrame({
+            "date": daily_dates,
+            "mse": daily_mse,
+            "sse": daily_sse,
+            "nobs": daily_nobs,
+        }),
+        "detail_df": pd.DataFrame(detail_rows),
+    }
+
+
+def build_period_stats(detail_df: pd.DataFrame, period_freq: str, prefix: str):
+    rows = []
+    df = detail_df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    df["period"] = df["date"].dt.to_period(period_freq).astype(str)
+
+    for p, g in df.groupby("period"):
+        yt = g["y_true"].to_numpy()
+        yp = g["y_pred"].to_numpy()
+        mse_ = float(mean_squared_error(yt, yp))
+        r2_ = float(r2_score(yt, yp)) if len(np.unique(yt)) > 1 else np.nan
+        rows.append({
+            "period": p,
+            f"mse_{prefix}": mse_,
+            f"r2_{prefix}": r2_,
+            "n_obs": int(len(g)),
+        })
+    return pd.DataFrame(rows).sort_values("period").reset_index(drop=True)
+
+
+# =======================
+# 4) 主流程
+# =======================
 def main():
-    panel, all_feats = build_panel()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("[INFO] device =", device)
+    print("[INFO] EXP_NAME =", EXP_NAME)
 
-    # 关键：只用训练集确定有效特征列
-    train_panel, train_feats = get_train_feature_cols(panel, all_feats)
+    pack = np.load(CACHE_NPZ)
+    X_np = pack["X_np"].astype(np.float32)
+    y_np = pack["y_np"].astype(np.float32)
+    mask_np = pack["mask_np"].astype(bool)
 
-    # 关键：只在训练集季度上做 LASSO
-    results, selected_all, stability = run_quarterly_lasso_train_only(
-        train_panel,
-        train_feats
+    with open(META_PKL, "rb") as f:
+        meta = pickle.load(f)
+
+    all_dates = [pd.Timestamp(d).normalize() for d in meta["all_dates"]]
+    ts_codes_order = list(meta["ts_codes_order"])
+    train_start_idx = int(meta["train_start_idx"])
+    train_end_idx = int(meta["train_end_idx"])
+    test_start_idx = int(meta["test_start_idx"])
+    test_end_idx = int(meta["test_end_idx"])
+
+    in_dim = X_np.shape[2]
+    print(f"[INFO] tensor: T={X_np.shape[0]}, N={X_np.shape[1]}, F={X_np.shape[2]}")
+
+    print("\n===== Train ZeroGraph baseline (validation-select) =====")
+    model, train_log_df, split_info = train_model_on_range(
+        X_np, y_np, mask_np, all_dates, ts_codes_order,
+        in_dim=in_dim,
+        device=device,
+        train_start_idx=train_start_idx,
+        train_end_idx=train_end_idx,
+        seed=0
     )
 
-    with open(OUT_PKL, "wb") as f:
-        pickle.dump(results, f)
+    train_log_df.to_csv(
+        os.path.join(RESULT_DIR, f"trainlog_{EXP_NAME}.csv"),
+        index=False,
+        encoding="utf-8-sig"
+    )
 
-    print("\n========== 输出完成 ==========")
-    print(f"PKL 结果：{OUT_PKL}")
-    print(f"每季度选中特征：{OUT_SELECTED_EACH_Q_CSV}")
-    print(f"跨季度稳定性表：{OUT_STABILITY_CSV}")
-    print(f"panel 信息：{OUT_PANEL_INFO_CSV}")
+    with open(os.path.join(RESULT_DIR, f"splitinfo_{EXP_NAME}.json"), "w", encoding="utf-8") as f:
+        json.dump(split_info, f, ensure_ascii=False, indent=2)
 
-    print("\nTop 30 稳定特征：")
-    if not stability.empty:
-        print(stability.head(30).to_string(index=False))
-    else:
-        print("无稳定特征。")
+    train_eval = evaluate_model_on_range(
+        model,
+        X_np, y_np, mask_np, all_dates, ts_codes_order,
+        device=device,
+        eval_start_idx=train_start_idx,
+        eval_end_idx=train_end_idx,
+        loss_curve=train_log_df["train_loss"].tolist()
+    )
+
+    test_eval = evaluate_model_on_range(
+        model,
+        X_np, y_np, mask_np, all_dates, ts_codes_order,
+        device=device,
+        eval_start_idx=test_start_idx,
+        eval_end_idx=test_end_idx,
+        loss_curve=train_log_df["train_loss"].tolist()
+    )
+
+    if train_eval is None or test_eval is None:
+        raise RuntimeError("ZeroGraph 评估为空，请检查数据覆盖。")
+
+    train_detail = train_eval["detail_df"].copy()
+    test_detail = test_eval["detail_df"].copy()
+
+    train_quarter = build_period_stats(train_detail, "Q", "zero")
+    test_month = build_period_stats(test_detail, "M", "zero")
+
+    summary_df = pd.DataFrame([{
+        "model": EXP_NAME,
+        "mse_train": train_eval["mse"],
+        "r2_train": train_eval["r2"],
+        "mse_test": test_eval["mse"],
+        "r2_test": test_eval["r2"],
+        "n_obs_train": train_eval["n_obs"],
+        "n_obs_test": test_eval["n_obs"],
+        "best_epoch": split_info["best_epoch"],
+        "best_val_score": split_info["best_val_score"],
+        "fit_end_idx": split_info["fit_end_idx"],
+        "val_start_idx": split_info["val_start_idx"],
+        "val_end_idx": split_info["val_end_idx"],
+    }])
+
+    train_detail.to_csv(os.path.join(RESULT_DIR, "predictions_ZeroGraph_train_detail.csv"), index=False, encoding="utf-8-sig")
+    test_detail.to_csv(os.path.join(RESULT_DIR, "predictions_ZeroGraph_test_detail.csv"), index=False, encoding="utf-8-sig")
+    train_eval["daily_df"].to_csv(os.path.join(RESULT_DIR, "daily_ZeroGraph_train.csv"), index=False, encoding="utf-8-sig")
+    test_eval["daily_df"].to_csv(os.path.join(RESULT_DIR, "daily_ZeroGraph_test.csv"), index=False, encoding="utf-8-sig")
+    train_quarter.to_csv(os.path.join(RESULT_DIR, "train_ZeroGraph_by_quarter.csv"), index=False, encoding="utf-8-sig")
+    test_month.to_csv(os.path.join(RESULT_DIR, "test_ZeroGraph_by_month.csv"), index=False, encoding="utf-8-sig")
+    summary_df.to_csv(os.path.join(RESULT_DIR, "summary_ZeroGraph.csv"), index=False, encoding="utf-8-sig")
+
+    print("\n完成：ZeroGraph baseline（validation-select）已保存到", RESULT_DIR)
+    print(summary_df)
 
 
 if __name__ == "__main__":
