@@ -1,0 +1,35 @@
+{
+  "DM_LAG": 2,
+  "definition": "d_t = MSE_baseline(t) - MSE_candidate(t); H1: mean(d_t) > 0.",
+  "comparisons": [
+    {
+      "candidate": "Proposed Graph-2",
+      "baseline": "ZeroGraph"
+    },
+    {
+      "candidate": "Proposed Graph-2",
+      "baseline": "LightGBM"
+    },
+    {
+      "candidate": "Proposed Graph-2",
+      "baseline": "GCN-LSTM"
+    },
+    {
+      "candidate": "Proposed Graph-2",
+      "baseline": "Transformer"
+    },
+    {
+      "candidate": "Proposed Graph-2",
+      "baseline": "Ridge"
+    },
+    {
+      "candidate": "Proposed Graph-2",
+      "baseline": "MLP"
+    }
+  ],
+  "outputs": {
+    "dm_csv": "D:\\PythonProject\\LASSO_FINAL\\SOTA\\final_eswa_sota\\tables\\Table4_DM.csv",
+    "daily_loss_diff_csv": "D:\\PythonProject\\LASSO_FINAL\\SOTA\\final_eswa_sota\\tables\\Table4_DM_daily_loss_differentials.csv",
+    "excel": "D:\\PythonProject\\LASSO_FINAL\\SOTA\\final_eswa_sota\\tables\\Table4_DM.xlsx"
+  }
+}
