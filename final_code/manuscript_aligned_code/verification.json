@@ -1,0 +1,66 @@
+{
+  "schema": "papergraph-v2-undirected-union-formula-loss",
+  "public_base_commit": "b08ebbf10f73ca3689d2ab6f5d8a201299d47487",
+  "manuscript_sha256": "768a3eb4b4cc74bd605133744452c755e5dabc103795e24ae08cb8f3cf5725b3",
+  "implementation_priority": "Equations 14-20; measured counts replace incompatible old counts",
+  "default_config": {
+    "lookback": 20,
+    "window": 20,
+    "neighbors": 40,
+    "threshold": 0.1,
+    "hidden": 128,
+    "epochs": 20,
+    "patience": 4,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.0001,
+    "gradient_clip": 1.0,
+    "laplacian": 0.001,
+    "min_nodes": 50,
+    "fit_end": "2024-06-05",
+    "validation_start": "2024-06-06",
+    "validation_end": "2024-12-31",
+    "test_start": "2025-01-02",
+    "test_end": "2025-11-17",
+    "expected_test_days": 211,
+    "protocol": "full_day"
+  },
+  "measured_parameters": {
+    "graph2": {
+      "registered": 137089,
+      "graph": 65792,
+      "head": 129
+    },
+    "zero": {
+      "registered": 137089,
+      "graph": 65792,
+      "head": 129
+    },
+    "identity": {
+      "registered": 137089,
+      "graph": 65792,
+      "head": 129
+    },
+    "5m_nograph": {
+      "registered": 137089,
+      "graph": 65792,
+      "head": 129
+    }
+  },
+  "verification": {
+    "tests": 43,
+    "failures": 0,
+    "errors": 0,
+    "full_5_by_20_synthetic_training": true,
+    "real_dataset_retraining": false,
+    "printed_manuscript_results_reproduced": false,
+    "portfolio_execution_certified": false
+  },
+  "environment": {
+    "python": "3.13.3",
+    "torch": "2.10.0+cpu",
+    "numpy": "2.3.0",
+    "pandas": "2.3.0",
+    "scipy": "1.15.3",
+    "pytest": "9.1.1"
+  }
+}
